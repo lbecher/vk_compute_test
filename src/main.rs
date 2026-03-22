@@ -13,7 +13,7 @@ use std::{
     time::Instant,
 };
 use vulkano::{
-    VulkanLibrary,
+    Version, VulkanLibrary,
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
         AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer,
@@ -279,12 +279,22 @@ struct PreparedResources {
 }
 
 fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| run_main())
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+fn run_main() -> Result<()> {
     let cli = Cli::parse();
     let library = VulkanLibrary::new().context("falha ao carregar o loader Vulkan")?;
     let instance = Instance::new(
         library,
         InstanceCreateInfo {
             flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+            max_api_version: Some(Version::V1_0),
             ..Default::default()
         },
     )
@@ -518,8 +528,7 @@ fn create_data_buffer(
             ..Default::default()
         },
         AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+            memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
         },
         seed_data,
