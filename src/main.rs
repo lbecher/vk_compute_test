@@ -26,7 +26,7 @@ use vulkano::{
         Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
         physical::PhysicalDevice,
     },
-    instance::{Instance, InstanceCreateFlags, InstanceCreateInfo},
+    instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions},
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
         Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo,
@@ -295,6 +295,10 @@ fn run_main() -> Result<()> {
         InstanceCreateInfo {
             flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
             max_api_version: Some(Version::V1_0),
+            enabled_extensions: vulkano::instance::InstanceExtensions {
+                khr_get_physical_device_properties2: true,
+                ..InstanceExtensions::empty()
+            },
             ..Default::default()
         },
     )
