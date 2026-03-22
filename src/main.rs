@@ -7,6 +7,7 @@ use naga::{
 };
 use serde::Serialize;
 use std::{
+    env::consts::{ARCH, OS},
     fs::File,
     path::{Path, PathBuf},
     sync::Arc,
@@ -16,7 +17,8 @@ use vulkano::{
     Version, VulkanLibrary,
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
-        AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer,
+        AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo, PrimaryAutoCommandBuffer,
+        PrimaryCommandBufferAbstract,
         allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
     },
     descriptor_set::{
@@ -157,6 +159,9 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     dispatches_per_run: u32,
 
+    #[arg(long, value_enum, default_value_t = BufferMode::HostVisible)]
+    buffer_mode: BufferMode,
+
     #[arg(long)]
     recreate_pipeline: bool,
 
@@ -194,10 +199,27 @@ impl ShaderKind {
     }
 }
 
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, ValueEnum)]
+enum BufferMode {
+    #[default]
+    HostVisible,
+    DeviceLocalStaged,
+}
+
+impl BufferMode {
+    fn description(self) -> &'static str {
+        match self {
+            BufferMode::HostVisible => "host-visible",
+            BufferMode::DeviceLocalStaged => "device-local-staged",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct BenchmarkConfig {
     shader: ShaderKind,
     shader_profile: &'static str,
+    buffer_mode: BufferMode,
     buffer_bytes: usize,
     element_count: usize,
     local_size_x: u32,
@@ -215,6 +237,9 @@ struct BenchmarkConfig {
 #[derive(Clone, Debug, Serialize)]
 struct DeviceMetadata {
     physical_device_index: usize,
+    host_os: String,
+    host_arch: String,
+    host_pointer_width_bits: u32,
     device_name: String,
     device_type: String,
     vendor_id: u32,
@@ -223,8 +248,10 @@ struct DeviceMetadata {
     api_version: String,
     queue_family_index: u32,
     queue_flags: String,
+    timestamp_compute_and_graphics: bool,
     timestamp_valid_bits: Option<u32>,
     timestamp_period_ns: Option<f32>,
+    gpu_timestamp_mode: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -266,10 +293,17 @@ struct AppContext {
     queue: Arc<Queue>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
-    data_buffer: Subbuffer<[u32]>,
+    data_buffers: DataBuffers,
     query_pool: Option<Arc<QueryPool>>,
     timestamp_period_ns: Option<f32>,
+    timestamp_start_stage: PipelineStage,
+    timestamp_end_stage: PipelineStage,
     device_metadata: DeviceMetadata,
+}
+
+struct DataBuffers {
+    storage_buffer: Subbuffer<[u32]>,
+    readback_buffer: Option<Subbuffer<[u32]>>,
 }
 
 #[derive(Clone)]
@@ -333,8 +367,12 @@ fn run_main() -> Result<()> {
     let report = run_benchmark(&app, config)?;
 
     println!(
-        "device={} queue_family={} shader={} dispatch=({}, {}, {}) runs={} gpu_timestamps={}",
+        "device={} driver={} host={}/{}-bit buffer_mode={} queue_family={} shader={} dispatch=({}, {}, {}) runs={} gpu_timestamps={} ({})",
         report.device.device_name,
+        report.device.driver_version,
+        report.device.host_arch,
+        report.device.host_pointer_width_bits,
+        report.config.buffer_mode.description(),
         report.device.queue_family_index,
         report.config.shader.description(),
         report.config.dispatch_x,
@@ -342,6 +380,7 @@ fn run_main() -> Result<()> {
         report.config.dispatch_z,
         report.samples.len(),
         report.device.timestamp_period_ns.is_some(),
+        report.device.gpu_timestamp_mode,
     );
     println!(
         "avg record={:.0} ns submit={:.0} ns wait={:.0} ns gpu={}",
@@ -379,6 +418,7 @@ fn build_config(cli: &Cli) -> Result<BenchmarkConfig> {
     Ok(BenchmarkConfig {
         shader: cli.shader,
         shader_profile: cli.shader.description(),
+        buffer_mode: cli.buffer_mode,
         buffer_bytes: cli.buffer_bytes,
         element_count,
         local_size_x: LOCAL_SIZE_X,
@@ -441,18 +481,43 @@ fn create_app_context(
         Default::default(),
     ));
     let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
-    let data_buffer = create_data_buffer(memory_allocator.clone(), config.element_count)?;
+    let data_buffers = create_data_buffers(
+        memory_allocator,
+        command_buffer_allocator.clone(),
+        queue.clone(),
+        config.element_count,
+        config.buffer_mode,
+    )?;
 
     let queue_family_properties =
         &physical_device.queue_family_properties()[queue_family_index as usize];
     let timestamp_valid_bits = queue_family_properties.timestamp_valid_bits;
-    let timestamp_period_ns = if timestamp_valid_bits.is_some()
-        && physical_device.properties().timestamp_compute_and_graphics
-    {
-        Some(physical_device.properties().timestamp_period)
-    } else {
-        None
-    };
+    let timestamp_compute_and_graphics =
+        physical_device.properties().timestamp_compute_and_graphics;
+    let timestamp_period_ns =
+        timestamp_valid_bits.map(|_| physical_device.properties().timestamp_period);
+    let (timestamp_start_stage, timestamp_end_stage, gpu_timestamp_mode) =
+        if timestamp_valid_bits.is_some() {
+            if timestamp_compute_and_graphics {
+                (
+                    PipelineStage::ComputeShader,
+                    PipelineStage::ComputeShader,
+                    "compute-stage",
+                )
+            } else {
+                (
+                    PipelineStage::TopOfPipe,
+                    PipelineStage::BottomOfPipe,
+                    "top-bottom-pipe",
+                )
+            }
+        } else {
+            (
+                PipelineStage::TopOfPipe,
+                PipelineStage::BottomOfPipe,
+                "unsupported",
+            )
+        };
     let query_pool = if timestamp_valid_bits.is_some() {
         Some(
             QueryPool::new(
@@ -471,6 +536,9 @@ fn create_app_context(
     let props = physical_device.properties();
     let device_metadata = DeviceMetadata {
         physical_device_index: device_index,
+        host_os: OS.to_string(),
+        host_arch: ARCH.to_string(),
+        host_pointer_width_bits: (std::mem::size_of::<usize>() as u32) * 8,
         device_name: props.device_name.clone(),
         device_type: format!("{:?}", props.device_type),
         vendor_id: props.vendor_id,
@@ -479,8 +547,10 @@ fn create_app_context(
         api_version: format!("{:?}", props.api_version),
         queue_family_index,
         queue_flags: format!("{:?}", queue_family_properties.queue_flags),
+        timestamp_compute_and_graphics,
         timestamp_valid_bits,
         timestamp_period_ns,
+        gpu_timestamp_mode: gpu_timestamp_mode.to_string(),
     };
 
     Ok(AppContext {
@@ -488,9 +558,11 @@ fn create_app_context(
         queue,
         command_buffer_allocator,
         descriptor_set_allocator,
-        data_buffer,
+        data_buffers,
         query_pool,
         timestamp_period_ns,
+        timestamp_start_stage,
+        timestamp_end_stage,
         device_metadata,
     })
 }
@@ -519,27 +591,128 @@ fn select_queue_family(physical_device: &Arc<PhysicalDevice>) -> Option<u32> {
     best_compute_with_timestamps.or(first_compute)
 }
 
-fn create_data_buffer(
-    memory_allocator: Arc<StandardMemoryAllocator>,
-    element_count: usize,
-) -> Result<Subbuffer<[u32]>> {
-    let seed_data = (0..element_count)
+fn seed_data(element_count: usize) -> Vec<u32> {
+    (0..element_count)
         .map(|index| index as u32 ^ 0xA5A5_5A5A)
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>()
+}
 
-    Buffer::from_iter(
-        memory_allocator,
-        BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        seed_data,
+fn create_data_buffers(
+    memory_allocator: Arc<StandardMemoryAllocator>,
+    command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+    queue: Arc<Queue>,
+    element_count: usize,
+    buffer_mode: BufferMode,
+) -> Result<DataBuffers> {
+    let seed_data = seed_data(element_count);
+
+    match buffer_mode {
+        BufferMode::HostVisible => Ok(DataBuffers {
+            storage_buffer: Buffer::from_iter(
+                memory_allocator,
+                BufferCreateInfo {
+                    usage: BufferUsage::STORAGE_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                seed_data,
+            )
+            .context("falha ao criar o buffer host-visible de dados")?,
+            readback_buffer: None,
+        }),
+        BufferMode::DeviceLocalStaged => {
+            let staging_buffer = Buffer::from_iter(
+                memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::TRANSFER_SRC,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                seed_data,
+            )
+            .context("falha ao criar o staging buffer de upload")?;
+
+            let storage_buffer = Buffer::new_slice::<u32>(
+                memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::STORAGE_BUFFER
+                        | BufferUsage::TRANSFER_DST
+                        | BufferUsage::TRANSFER_SRC,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                    ..Default::default()
+                },
+                element_count as u64,
+            )
+            .context("falha ao criar o buffer device-local de dados")?;
+
+            let readback_buffer = Buffer::new_slice::<u32>(
+                memory_allocator,
+                BufferCreateInfo {
+                    usage: BufferUsage::TRANSFER_DST,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                        | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                    ..Default::default()
+                },
+                element_count as u64,
+            )
+            .context("falha ao criar o staging buffer de leitura")?;
+
+            copy_buffer_and_wait(
+                command_buffer_allocator,
+                queue,
+                staging_buffer,
+                storage_buffer.clone(),
+                "falha ao enviar os dados iniciais para o buffer device-local",
+            )?;
+
+            Ok(DataBuffers {
+                storage_buffer,
+                readback_buffer: Some(readback_buffer),
+            })
+        }
+    }
+}
+
+fn copy_buffer_and_wait(
+    command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+    queue: Arc<Queue>,
+    src: Subbuffer<[u32]>,
+    dst: Subbuffer<[u32]>,
+    error_context: &'static str,
+) -> Result<()> {
+    let mut builder = AutoCommandBufferBuilder::primary(
+        command_buffer_allocator,
+        queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
     )
-    .context("falha ao criar o buffer de dados")
+    .context("falha ao criar o command buffer de cópia")?;
+    builder
+        .copy_buffer(CopyBufferInfo::buffers(src, dst))
+        .context("falha ao gravar comando de cópia de buffer")?;
+    let command_buffer = builder
+        .build()
+        .context("falha ao finalizar o command buffer de cópia")?;
+
+    command_buffer
+        .execute(queue)
+        .context(error_context)?
+        .then_signal_fence_and_flush()
+        .context("falha ao sinalizar fence para a cópia")?
+        .wait(None)
+        .context("falha ao aguardar a conclusão da cópia")
 }
 
 fn run_benchmark(app: &AppContext, config: BenchmarkConfig) -> Result<BenchmarkReport> {
@@ -617,7 +790,7 @@ fn run_benchmark(app: &AppContext, config: BenchmarkConfig) -> Result<BenchmarkR
         };
 
         let timing = submit_and_measure(app, &command_buffers)?;
-        let checksum = checksum_buffer(&app.data_buffer)?;
+        let checksum = checksum_buffer(app)?;
 
         samples.push(BenchmarkSample {
             run_index,
@@ -653,7 +826,10 @@ fn prepare_resources(app: &AppContext, shader_kind: ShaderKind) -> Result<Prepar
     let descriptor_set = DescriptorSet::new(
         app.descriptor_set_allocator.clone(),
         set_layout,
-        [WriteDescriptorSet::buffer(0, app.data_buffer.clone())],
+        [WriteDescriptorSet::buffer(
+            0,
+            app.data_buffers.storage_buffer.clone(),
+        )],
         [],
     )
     .context("falha ao criar o descriptor set")?;
@@ -783,7 +959,7 @@ fn build_single_command_buffer(
                     .reset_query_pool(query_pool.clone(), 0..2)
                     .context("falha ao resetar query pool")?;
                 builder
-                    .write_timestamp(query_pool.clone(), 0, PipelineStage::TopOfPipe)
+                    .write_timestamp(query_pool.clone(), 0, app.timestamp_start_stage)
                     .context("falha ao gravar timestamp inicial")?;
             }
         }
@@ -812,7 +988,7 @@ fn build_single_command_buffer(
         if let Some(query_pool) = &app.query_pool {
             unsafe {
                 builder
-                    .write_timestamp(query_pool.clone(), 1, PipelineStage::BottomOfPipe)
+                    .write_timestamp(query_pool.clone(), 1, app.timestamp_end_stage)
                     .context("falha ao gravar timestamp final")?;
             }
         }
@@ -876,7 +1052,20 @@ fn read_gpu_timing(app: &AppContext) -> Result<Option<f64>> {
     Ok(Some(ticks as f64 * timestamp_period_ns as f64))
 }
 
-fn checksum_buffer(buffer: &Subbuffer<[u32]>) -> Result<u64> {
+fn checksum_buffer(app: &AppContext) -> Result<u64> {
+    let buffer = if let Some(readback_buffer) = &app.data_buffers.readback_buffer {
+        copy_buffer_and_wait(
+            app.command_buffer_allocator.clone(),
+            app.queue.clone(),
+            app.data_buffers.storage_buffer.clone(),
+            readback_buffer.clone(),
+            "falha ao copiar o buffer device-local para leitura no host",
+        )?;
+        readback_buffer
+    } else {
+        &app.data_buffers.storage_buffer
+    };
+
     let content = buffer
         .read()
         .context("falha ao mapear o buffer para checksum")?;
@@ -953,8 +1142,18 @@ fn export_csv(path: &Path, report: &BenchmarkReport) -> Result<()> {
     #[derive(Serialize)]
     struct CsvRow<'a> {
         shader: &'a str,
+        buffer_mode: &'a str,
+        host_os: &'a str,
+        host_arch: &'a str,
+        host_pointer_width_bits: u32,
         device_name: &'a str,
+        driver_version: &'a str,
+        api_version: &'a str,
         queue_family_index: u32,
+        timestamp_compute_and_graphics: bool,
+        timestamp_valid_bits: Option<u32>,
+        timestamp_period_ns: Option<f32>,
+        gpu_timestamp_mode: &'a str,
         dispatch_x: u32,
         dispatch_y: u32,
         dispatch_z: u32,
@@ -975,8 +1174,18 @@ fn export_csv(path: &Path, report: &BenchmarkReport) -> Result<()> {
     for sample in &report.samples {
         writer.serialize(CsvRow {
             shader: report.config.shader_profile,
+            buffer_mode: report.config.buffer_mode.description(),
+            host_os: &report.device.host_os,
+            host_arch: &report.device.host_arch,
+            host_pointer_width_bits: report.device.host_pointer_width_bits,
             device_name: &report.device.device_name,
+            driver_version: &report.device.driver_version,
+            api_version: &report.device.api_version,
             queue_family_index: report.device.queue_family_index,
+            timestamp_compute_and_graphics: report.device.timestamp_compute_and_graphics,
+            timestamp_valid_bits: report.device.timestamp_valid_bits,
+            timestamp_period_ns: report.device.timestamp_period_ns,
+            gpu_timestamp_mode: &report.device.gpu_timestamp_mode,
             dispatch_x: report.config.dispatch_x,
             dispatch_y: report.config.dispatch_y,
             dispatch_z: report.config.dispatch_z,
