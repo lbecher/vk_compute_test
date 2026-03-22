@@ -406,6 +406,7 @@ fn create_app_context(
     let supported_extensions = physical_device.supported_extensions();
     let device_extensions = DeviceExtensions {
         khr_portability_subset: supported_extensions.khr_portability_subset,
+        khr_storage_buffer_storage_class: supported_extensions.khr_storage_buffer_storage_class,
         ..DeviceExtensions::empty()
     };
 
